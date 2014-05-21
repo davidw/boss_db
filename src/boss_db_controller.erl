@@ -7,6 +7,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(MAXDELAY, 10000).
+-define(INACTIVE_TIMEOUT, 60000).
 
 -record(state, {
 	  connection_state,
@@ -85,7 +86,6 @@ init(Options) ->
     CacheTTL	= proplists:get_value(cache_exp_time, Options, 60),
     CachePrefix = proplists:get_value(cache_prefix, Options, db),
     process_flag(trap_exit, true),
-    try_connection(self(), Options),
     {ok, #state{connection_state	= connecting,
 		connection_delay	= 1,
 		options			= Options,
@@ -96,15 +96,25 @@ init(Options) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-handle_call(_Anything, _Anyone, State) when State#state.connection_state /= connected ->
-    {reply, db_connection_down, State};
+handle_call(Command, From, State) when State#state.connection_state /= connected ->
+    {noreply, NewState} = do_connect(State, State#state.options),
+    %% The connection was successful; now call the call we really
+    %% wanted to call.
+    case NewState#state.connection_state of
+        connected ->
+            handle_call(Command, From, NewState);
+        _ ->
+            %% Could not connect.  The system will try reconnecting
+            %% with an exponential backoff.
+            {reply, db_connection_down, NewState}
+    end;
 
 handle_call({find, Key}, From, #state{ cache_enable = true, cache_prefix = Prefix } = State) ->
     CacheResult = boss_cache:get(Prefix, Key),
     find_by_key(Key, From, Prefix, State, CacheResult);
 handle_call({find, Key}, _From, #state{ cache_enable = false } = State) ->
     {Adapter, Conn, _} = db_for_key(Key, State),
-    {reply, Adapter:find(Conn, Key), State};
+    {reply, Adapter:find(Conn, Key), State, ?INACTIVE_TIMEOUT};
 
 handle_call({find, Type, Conditions, Max, Skip, Sort, SortOrder, Include} = Cmd, From, 
     #state{ cache_enable = true, cache_prefix = Prefix } = State) ->
@@ -112,50 +122,50 @@ handle_call({find, Type, Conditions, Max, Skip, Sort, SortOrder, Include} = Cmd,
     case boss_cache:get(Prefix, Key) of
         undefined ->
             Res = find_list(Type, Include, Cmd, From, Prefix, State, Key),
-            {reply, Res, State};
+            {reply, Res, State, ?INACTIVE_TIMEOUT};
         CachedValue ->
             boss_news:extend_watch(Key),
-            {reply, CachedValue, State}
+            {reply, CachedValue, State, ?INACTIVE_TIMEOUT}
     end;
 handle_call({find, Type, Conditions, Max, Skip, Sort, SortOrder, _}, _From, #state{ cache_enable = false } = State) ->
     {Adapter, Conn, _} = db_for_type(Type, State),
-    {reply, Adapter:find(Conn, Type, Conditions, Max, Skip, Sort, SortOrder), State};
+    {reply, Adapter:find(Conn, Type, Conditions, Max, Skip, Sort, SortOrder), State, ?INACTIVE_TIMEOUT};
 
 handle_call({get_migrations_table}, _From, #state{ cache_enable = false } = State) ->
     {Adapter, Conn} = {State#state.adapter, State#state.read_connection},
-    {reply, Adapter:get_migrations_table(Conn), State};
+    {reply, Adapter:get_migrations_table(Conn), State, ?INACTIVE_TIMEOUT};
 
 handle_call({migration_done, Tag, Direction}, _From, #state{ cache_enable = false } = State) ->
     {Adapter, Conn} = {State#state.adapter, State#state.write_connection},
-    {reply, Adapter:migration_done(Conn, Tag, Direction), State};
+    {reply, Adapter:migration_done(Conn, Tag, Direction), State, ?INACTIVE_TIMEOUT};
 
 handle_call({count, Type}, _From, State) ->
     {Adapter, Conn, _} = db_for_type(Type, State),
-    {reply, Adapter:count(Conn, Type), State};
+    {reply, Adapter:count(Conn, Type), State, ?INACTIVE_TIMEOUT};
 
 handle_call({count, Type, Conditions}, _From, State) ->
     {Adapter, Conn, _} = db_for_type(Type, State),
-    {reply, Adapter:count(Conn, Type, Conditions), State};
+    {reply, Adapter:count(Conn, Type, Conditions), State, ?INACTIVE_TIMEOUT};
 
 handle_call({counter, Counter}, _From, State) ->
     {Adapter, Conn, _} = db_for_counter(Counter, State),
-    {reply, Adapter:counter(Conn, Counter), State};
+    {reply, Adapter:counter(Conn, Counter), State, ?INACTIVE_TIMEOUT};
 
 handle_call({incr, Key}, _From, State) ->
     {Adapter, _, Conn} = db_for_counter(Key, State),
-    {reply, Adapter:incr(Conn, Key), State};
+    {reply, Adapter:incr(Conn, Key), State, ?INACTIVE_TIMEOUT};
 
 handle_call({incr, Key, Count}, _From, State) ->
     {Adapter, _, Conn} = db_for_counter(Key, State),
-    {reply, Adapter:incr(Conn, Key, Count), State};
+    {reply, Adapter:incr(Conn, Key, Count), State, ?INACTIVE_TIMEOUT};
 
 handle_call({delete, Id}, _From, State) ->
     {Adapter, _, Conn} = db_for_key(Id, State),
-    {reply, Adapter:delete(Conn, Id), State};
+    {reply, Adapter:delete(Conn, Id), State, ?INACTIVE_TIMEOUT};
 
 handle_call({save_record, Record}, _From, State) ->
     {Adapter, _, Conn} = db_for_record(Record, State),
-    {reply, Adapter:save_record(Conn, Record), State};
+    {reply, Adapter:save_record(Conn, Record), State, ?INACTIVE_TIMEOUT};
 
 handle_call(push, _From, State) ->
     Adapter = State#state.adapter,
@@ -170,44 +180,49 @@ handle_call(pop, _From, State) ->
     {reply, Adapter:pop(Conn, Depth), State#state{depth = Depth - 1}};
 
 handle_call(depth, _From, State) ->
-    {reply, State#state.depth, State};
+    {reply, State#state.depth, State, ?INACTIVE_TIMEOUT};
 
 handle_call(dump, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.read_connection,
-    {reply, Adapter:dump(Conn), State};
+    {reply, Adapter:dump(Conn), State, ?INACTIVE_TIMEOUT};
 
 handle_call({create_table, TableName, TableDefinition}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.write_connection,
-    {reply, Adapter:create_table(Conn, TableName, TableDefinition), State};
+    {reply, Adapter:create_table(Conn, TableName, TableDefinition), State, ?INACTIVE_TIMEOUT};
 
 handle_call({table_exists, TableName}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.read_connection,
-    {reply, Adapter:table_exists(Conn, TableName), State};
+    {reply, Adapter:table_exists(Conn, TableName), State, ?INACTIVE_TIMEOUT};
 
 handle_call({execute, Commands}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.write_connection,
-    {reply, Adapter:execute(Conn, Commands), State};
+    {reply, Adapter:execute(Conn, Commands), State, ?INACTIVE_TIMEOUT};
 
 handle_call({execute, Commands, Params}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.write_connection,
-    {reply, Adapter:execute(Conn, Commands, Params), State};
+    {reply, Adapter:execute(Conn, Commands, Params), State, ?INACTIVE_TIMEOUT};
 
 handle_call({transaction, TransactionFun}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.write_connection,
-    {reply, Adapter:transaction(Conn, TransactionFun), State};
+    {reply, Adapter:transaction(Conn, TransactionFun), State, ?INACTIVE_TIMEOUT};
 
 handle_call(state, _From, State) ->
-    {reply, State, State}.
-
+    {reply, State, State, ?INACTIVE_TIMEOUT}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 handle_cast({try_connect, Options}, State) when State#state.connection_state /= connected ->
+    do_connect(State, Options);
+
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+do_connect(State, Options) ->
     Adapter	= State#state.adapter,
     CacheEnable = State#state.cache_enable,
     CacheTTL	= State#state.cache_ttl,
@@ -223,14 +238,13 @@ handle_cast({try_connect, Options}, State) when State#state.connection_state /= 
     catch
 	_Error ->
 	    reconnect_no_reply(Options, State, Adapter, CacheEnable, CacheTTL)
-    end;
-
-handle_cast(_Request, State) ->
-    {noreply, State}.
-
+    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 terminate(_Reason, State) ->
+    cleanup(State).
+
+cleanup(State) ->
     Adapter = State#state.adapter,
     case State#state.connection_retry_timer of
 	undefined ->
@@ -241,13 +255,19 @@ terminate(_Reason, State) ->
     terminate_connections(Adapter, State#state.read_connection, State#state.write_connection),
     lists:map(fun({A, RC, WC}) -> terminate_connections(A, RC, WC) end, State#state.shards).
 
-
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% We have received a timeout due to inactivity.  Close things down.
+%% We won't try and reconnect unless we get a new connection.
+handle_info(timeout, State) ->
+    cleanup(State),
+    {noreply, State#state{read_connection = undefined, write_connection = undefined,
+                          connection_state = disconnected}};
+
 handle_info(stop, State) ->
     {stop, shutdown, State};
 
