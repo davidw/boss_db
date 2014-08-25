@@ -107,7 +107,7 @@ incr(Conn, Id, Count) ->
         [Count, Id]),
     case Res of
         {ok, _, _, [{Value}]} -> Value;
-        {error, _Reason} -> 
+        {ok, 0} ->
             Res1 = pgsql:equery(Conn, "INSERT INTO counters (name, value) VALUES ($1, $2) RETURNING value", 
                 [Id, Count]),
             case Res1 of
